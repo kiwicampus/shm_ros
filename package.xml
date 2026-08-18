@@ -29,8 +29,12 @@
   <member_of_group condition="$ROS_VERSION == 2">rosidl_interface_packages</member_of_group>
 
   <export>
-    <build_type condition="$ROS_VERSION == 2">ament_cmake</build_type>
+    <!-- ROS1 FIRST. catkin_make_isolated takes the first build_type export
+         without evaluating its condition, so ament_cmake here reads as an
+         unknown build type and the whole Noetic workspace refuses to build.
+         colcon does evaluate the conditions, so this order is safe for both. -->
     <build_type condition="$ROS_VERSION == 1">catkin</build_type>
+    <build_type condition="$ROS_VERSION == 2">ament_cmake</build_type>
     <ros1_bridge mapping_rules="mapping_rules.yaml"/>
   </export>
 </package>
