@@ -80,6 +80,21 @@ inline std::string segment_path(const std::string &topic) {
   return "/dev/shm/" + segment_name(topic);
 }
 
+// Bytes per pixel by encoding, as in sensor_msgs/Image. Unknown encodings are
+// treated as 3: rgb8 is what every producer here writes.
+inline size_t channels_for(const std::string &encoding) {
+  if (encoding == "mono8" || encoding == "mono16") return 1;
+  if (encoding == "rgba8" || encoding == "bgra8") return 4;
+  return 3;
+}
+
+// Size of one frame. Call this rather than spelling out height * width * 3 at a
+// call site — that is the sort of thing that silently rots when a mono or RGBA
+// producer shows up.
+inline size_t frame_bytes(uint32_t height, uint32_t width, const std::string &encoding) {
+  return static_cast<size_t>(height) * static_cast<size_t>(width) * channels_for(encoding);
+}
+
 // ShmConf::GetCeilingMessageSize: the first bucket that fits, else the largest.
 inline const Bucket &bucket_for_frame(size_t frame_bytes) {
   for (const Bucket &bucket : kBuckets) {
@@ -394,6 +409,15 @@ class ImageReader {
     }
     last_error_.clear();
     return pixels;
+  }
+
+  // Same, taking the geometry off an announcement. Templated rather than typed
+  // on shm_ros::msg::ShmImage so this header stays free of the generated message
+  // — and so any message carrying the same fields works.
+  template <typename MessageT>
+  const uint8_t *frame_from(const MessageT &msg) {
+    return frame(msg.block_id, frame_bytes(msg.height, msg.width, msg.encoding),
+                 msg.segment);
   }
 
   const SegmentReader &segment_reader() const { return reader_; }

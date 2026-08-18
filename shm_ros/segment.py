@@ -46,6 +46,28 @@ def segment_path(topic: str) -> str:
     return "/dev/shm/" + segment_name(topic)
 
 
+def channels_for(encoding: str) -> int:
+    """Bytes per pixel for an encoding, as in ``sensor_msgs/Image``.
+
+    Unknown encodings are treated as 3: rgb8 is what every producer here writes.
+    """
+    if encoding in ("mono8", "mono16"):
+        return 1
+    if encoding in ("rgba8", "bgra8"):
+        return 4
+    return 3
+
+
+def frame_bytes(height: int, width: int, encoding: str) -> int:
+    """Size of one frame.
+
+    Call this rather than spelling out ``height * width * 3`` at a call site --
+    that is the sort of thing that silently rots when a mono or RGBA producer
+    shows up.
+    """
+    return height * width * channels_for(encoding)
+
+
 def bucket_for_frame(frame_bytes: int) -> Tuple[int, int]:
     """First bucket a frame fits in, else the largest.
 
@@ -412,9 +434,6 @@ class ImageReader:
     theirs. Imports no ROS.
     """
 
-    #: Channels per pixel by encoding; anything unlisted is treated as 3.
-    CHANNELS = {"mono8": 1, "mono16": 1, "rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4}
-
     def __init__(self, topic: str) -> None:
         """``topic`` is the fallback segment, until a producer names its own."""
         self._topic = topic
@@ -466,7 +485,7 @@ class ImageReader:
             msg.block_id,
             msg.height,
             msg.width,
-            self.CHANNELS.get(encoding, 3),
+            channels_for(encoding),
             getattr(msg, "segment", "") or "",
         )
 

@@ -12,7 +12,7 @@ parses the constants straight out of segment.hpp and compares.
 import re
 from pathlib import Path
 
-from shm_ros.segment import BUCKETS, BUFFER_BASE, CEILING_OFFSET
+from shm_ros.segment import BUCKETS, BUFFER_BASE, CEILING_OFFSET, channels_for
 
 # =============================================================================
 
@@ -54,6 +54,35 @@ def test_bucket_ladder_matches_exactly():
     pairs = re.findall(r"\{([^,]+),\s*(\d+)\}", block.group(1))
     from_header = tuple((_shift(ceiling), int(blocks)) for ceiling, blocks in pairs)
     assert from_header == BUCKETS
+
+
+def test_channels_per_encoding_match():
+    """The two channel tables must agree, or a mono producer tears in one language."""
+    body = re.search(r"inline size_t channels_for\(.*?\n\}", _header(), re.S)
+    assert body, "channels_for not found in the header"
+
+    from_header = {}
+    for line in body.group(0).splitlines():
+        rule = re.search(r"if \((.*?)\)\s*return\s*(\d+);", line)
+        if rule:
+            for encoding in re.findall(r'"([^"]+)"', rule.group(1)):
+                from_header[encoding] = int(rule.group(2))
+    default = re.search(r"return\s*(\d+);\s*\n\}", body.group(0))
+    assert default, "channels_for has no default"
+
+    assert from_header, "no encodings parsed out of channels_for"
+    for encoding, channels in from_header.items():
+        assert channels_for(encoding) == channels, encoding
+    # And the fall-through, for anything the table does not name.
+    assert channels_for("something_new") == int(default.group(1))
+
+
+def test_frame_bytes_uses_the_channel_table():
+    from shm_ros.segment import frame_bytes
+
+    assert frame_bytes(480, 640, "rgb8") == 480 * 640 * 3
+    assert frame_bytes(480, 640, "mono8") == 480 * 640
+    assert frame_bytes(480, 640, "rgba8") == 480 * 640 * 4
 
 
 def test_every_bucket_size_is_reachable():
