@@ -1,0 +1,6 @@
+# ros1_bridge pairs ROS1 and ROS2 packages by name, and only auto-pairs names
+# ending in _msgs. shm_ros does not, so state the pair explicitly or the bridge
+# generates no ShmImage factory and the fixer's topics never cross.
+-
+  ros1_package_name: 'shm_ros'
+  ros2_package_name: 'shm_ros'
