@@ -357,6 +357,56 @@ class SegmentWriter {
   std::string last_error_;
 };
 
+// ============================================================================
+
+// Consumer-side rules in one place. A consumer that drives SegmentReader by hand
+// has to remember both of these, and both fail SILENTLY when forgotten:
+//   1. Re-open every frame. A producer restart — which is what a resolution
+//      change is — replaces the segment; a mapping held from before reads the old
+//      stride at wrong offsets and the picture tears with no error raised.
+//   2. Honour the segment the producer NAMES over one derived from the topic, so
+//      a bridge can rename the topic while leaving the segment alone.
+// Takes plain fields rather than a message, so it serves any announcement type:
+// shm_ros/ShmImage from our producers, astribot_camera/CameraImage from theirs.
+class ImageReader {
+ public:
+  // `topic` is the fallback segment, used until a producer names its own.
+  explicit ImageReader(std::string topic) : topic_(std::move(topic)) {}
+
+  // Pointer to `frame_bytes` of pixels, or nullptr with last_error() set. The
+  // pointer aliases the mapping: copy it out before the writer laps the ring.
+  const uint8_t *frame(uint64_t block_id, size_t frame_bytes,
+                       const std::string &segment = std::string()) {
+    const std::string &wanted = segment.empty() ? topic_ : segment;
+    if (wanted != current_) {
+      reader_.close();
+      current_ = wanted;
+    }
+    if (!reader_.open(current_)) {
+      last_error_ = reader_.last_error();
+      return nullptr;
+    }
+    const uint8_t *pixels = reader_.frame(block_id, frame_bytes);
+    if (pixels == nullptr) {
+      last_error_ = "block " + std::to_string(block_id) + " unreadable in a ring of " +
+                    std::to_string(reader_.block_num());
+      return nullptr;
+    }
+    last_error_.clear();
+    return pixels;
+  }
+
+  const SegmentReader &segment_reader() const { return reader_; }
+  const std::string &segment() const { return current_; }
+  const std::string &last_error() const { return last_error_; }
+
+ private:
+  SegmentReader reader_;
+  std::string topic_;
+  std::string current_;
+  std::string last_error_;
+};
+
 }  // namespace shm_ros
 
 #endif  // SHM_ROS__SEGMENT_HPP_

@@ -143,7 +143,9 @@ class SegmentReader:
             self.last_error = f"cannot open {self._path}: {exc}"
             return False
         try:
-            mapping = mmap.mmap(descriptor, status.st_size, mmap.MAP_SHARED, mmap.PROT_READ)
+            mapping = mmap.mmap(
+                descriptor, status.st_size, mmap.MAP_SHARED, mmap.PROT_READ
+            )
         except (OSError, ValueError) as exc:
             os.close(descriptor)
             self.last_error = f"cannot mmap {self._path}: {exc}"
@@ -179,7 +181,10 @@ class SegmentReader:
                 self._view[CEILING_OFFSET : CEILING_OFFSET + 8], "little"
             )
             for ceiling, block_num in BUCKETS:
-                if ceiling == announced and BUFFER_BASE + block_num * ceiling == self._length:
+                if (
+                    ceiling == announced
+                    and BUFFER_BASE + block_num * ceiling == self._length
+                ):
                     return ceiling, block_num
         return bucket_for_segment(self._length)
 
@@ -216,9 +221,9 @@ class SegmentReader:
             )
             return None
 
-        return np.frombuffer(self._view[offset : offset + size], dtype=np.uint8).reshape(
-            height, width, channels
-        )
+        return np.frombuffer(
+            self._view[offset : offset + size], dtype=np.uint8
+        ).reshape(height, width, channels)
 
     def close(self) -> None:
         """Unmap and close. Idempotent, and safe with views outstanding."""
@@ -388,3 +393,83 @@ class SegmentWriter:
     def __exit__(self, *_exc_info: object) -> None:
         """Unlink on exit."""
         self.close()
+
+
+class ImageReader:
+    """Consumer-side rules in one place.
+
+    A consumer that drives :class:`SegmentReader` by hand has to remember both of
+    these, and both fail SILENTLY when forgotten:
+
+    1. Re-open every frame. A producer restart -- which is what a resolution
+       change is -- replaces the segment; a mapping held from before reads the old
+       stride at wrong offsets and the picture tears with no error raised.
+    2. Honour the segment the producer NAMES over one derived from the topic, so a
+       bridge can rename the topic while leaving the segment alone.
+
+    Takes plain fields rather than a message, so it serves any announcement type:
+    ``shm_ros/ShmImage`` from our producers, ``astribot_camera/CameraImage`` from
+    theirs. Imports no ROS.
+    """
+
+    #: Channels per pixel by encoding; anything unlisted is treated as 3.
+    CHANNELS = {"mono8": 1, "mono16": 1, "rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4}
+
+    def __init__(self, topic: str) -> None:
+        """``topic`` is the fallback segment, until a producer names its own."""
+        self._topic = topic
+        self._current = ""
+        self._reader = SegmentReader(topic)
+        self.last_error = ""
+
+    @property
+    def reader(self) -> SegmentReader:
+        """The underlying reader, for stride and block_num reporting."""
+        return self._reader
+
+    @property
+    def segment(self) -> str:
+        """Segment currently mapped."""
+        return self._current
+
+    def frame(
+        self,
+        block_id: int,
+        height: int,
+        width: int,
+        channels: int = 3,
+        segment: str = "",
+    ) -> Optional[np.ndarray]:
+        """Read-only view of the announced block, or None with ``last_error`` set."""
+        wanted = segment or self._topic
+        if wanted != self._current:
+            self._reader.close()
+            self._reader = SegmentReader(wanted)
+            self._current = wanted
+
+        if not self._reader.open():
+            self.last_error = self._reader.last_error
+            return None
+
+        view = self._reader.frame(block_id, height, width, channels)
+        if view is None:
+            self.last_error = self._reader.last_error
+            return None
+
+        self.last_error = ""
+        return view
+
+    def frame_from(self, msg: object) -> Optional[np.ndarray]:
+        """Same, reading the fields off a ShmImage (or any message shaped like one)."""
+        encoding = getattr(msg, "encoding", "") or "rgb8"
+        return self.frame(
+            msg.block_id,
+            msg.height,
+            msg.width,
+            self.CHANNELS.get(encoding, 3),
+            getattr(msg, "segment", "") or "",
+        )
+
+    def close(self) -> None:
+        """Unmap the segment."""
+        self._reader.close()

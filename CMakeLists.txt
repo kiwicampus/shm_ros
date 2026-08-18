@@ -36,7 +36,7 @@ if(ament_cmake_FOUND)  # ROS2
   # so ament_python_install_package would collide on the same target. Install our
   # module INTO that package instead: shm_ros.segment sits beside shm_ros.msg.
   # We deliberately ship no __init__.py — the generated one owns it.
-  install(FILES ${PROJECT_NAME}/segment.py ${PROJECT_NAME}/subscriber.py
+  install(FILES ${PROJECT_NAME}/segment.py
     DESTINATION ${PYTHON_INSTALL_DIR}/${PROJECT_NAME})
 
   # ros1_bridge mapping rule (see package.xml export) — forces the ROS1<->ROS2

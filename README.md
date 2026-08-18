@@ -17,8 +17,8 @@ your own producers.
 | `msg/ShmImage.msg` | the announcement: segment, geometry, block id, seq |
 | `include/shm_ros/segment.hpp` | header-only `SegmentReader` / `SegmentWriter`. No ROS, no OpenCV |
 | `include/shm_ros/publisher.hpp` | header-only `ImagePublisher`: segment + announcement, correctly ordered |
-| `shm_ros/segment.py` | the same reader and writer in pure Python |
-| `shm_ros/subscriber.py` | `ImageSubscriber`: announcement to numpy frame |
+| `include/shm_ros/segment.hpp` | also `ImageReader`: the consumer rules, ROS-free |
+| `shm_ros/segment.py` | the same three classes in pure Python |
 
 C++ is header-only, so there is nothing to link beyond `rclcpp` and this
 package's typesupport.
@@ -35,27 +35,27 @@ shm.publish(data, size, width, height, "rgb8", step, header);
 ## Consuming
 
 ```python
-from shm_ros.subscriber import ImageSubscriber
+from shm_ros.segment import ImageReader
 
-def on_frame(frame, msg):      # frame is an HxWxC numpy view of the block
-    ...
-
-source = ImageSubscriber(node, "/camera/color/image_shm", on_frame)
+source = ImageReader("/camera/color/image_shm")
+frame = source.frame_from(msg)      # HxWxC numpy view of the block, or None
 ```
 
 ```cpp
 #include <shm_ros/segment.hpp>
 
-shm_ros::SegmentReader reader;
-if (reader.open(msg->segment.empty() ? topic : msg->segment)) {
-  const uint8_t *pixels = reader.frame(msg->block_id, msg->height * msg->width * 3);
-}
+shm_ros::ImageReader reader(topic);
+const uint8_t *pixels = reader.frame(msg->block_id, height * width * 3, msg->segment);
 ```
+
+`ImageReader` takes plain fields rather than a message, so it serves any
+announcement type — `shm_ros/ShmImage` from your producers, the vendor's own from
+theirs. It creates no subscription: QoS and wiring stay with the consumer.
 
 ## Two rules that fail silently if you break them
 
-Use `ImagePublisher` and `ImageSubscriber` and you get both for free. If you
-drive `SegmentReader` and `SegmentWriter` yourself:
+Use `ImagePublisher` and `ImageReader` and you get both for free. If you drive
+`SegmentReader` and `SegmentWriter` yourself:
 
 1. **A consumer must re-open every frame.** `open()` is idempotent and cheap, and
    it compares the inode. A producer restart — which is what a resolution change
