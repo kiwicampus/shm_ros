@@ -61,13 +61,15 @@ def test_channels_per_encoding_match():
     body = re.search(r"inline size_t channels_for\(.*?\n\}", _header(), re.S)
     assert body, "channels_for not found in the header"
 
+    # Flatten first: conditions wrap across lines to stay inside the line limit,
+    # and a line-by-line parser silently skips them — checking nothing.
+    flat = " ".join(body.group(0).split())
+
     from_header = {}
-    for line in body.group(0).splitlines():
-        rule = re.search(r"if \((.*?)\)\s*return\s*(\d+);", line)
-        if rule:
-            for encoding in re.findall(r'"([^"]+)"', rule.group(1)):
-                from_header[encoding] = int(rule.group(2))
-    default = re.search(r"return\s*(\d+);\s*\n\}", body.group(0))
+    for condition, value in re.findall(r"if \((.*?)\)\s*\{?\s*return\s*(\d+);", flat):
+        for encoding in re.findall(r'"([^"]+)"', condition):
+            from_header[encoding] = int(value)
+    default = re.search(r"return\s*(\d+);\s*\}$", flat)
     assert default, "channels_for has no default"
 
     assert from_header, "no encodings parsed out of channels_for"
@@ -75,6 +77,10 @@ def test_channels_per_encoding_match():
         assert channels_for(encoding) == channels, encoding
     # And the fall-through, for anything the table does not name.
     assert channels_for("something_new") == int(default.group(1))
+    # The 2-byte formats must actually be in there — this is the class of bug
+    # that shipped: a 2-byte encoding silently sized as 3.
+    assert from_header.get("yuv422_yuy2") == 2
+    assert from_header.get("mono16") == 2
 
 
 def test_frame_bytes_uses_the_channel_table():

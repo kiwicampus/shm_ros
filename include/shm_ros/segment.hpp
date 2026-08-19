@@ -80,17 +80,29 @@ inline std::string segment_path(const std::string &topic) {
   return "/dev/shm/" + segment_name(topic);
 }
 
-// Bytes per pixel by encoding, as in sensor_msgs/Image. Unknown encodings are
-// treated as 3: rgb8 is what every producer here writes.
+// BYTES per pixel by encoding, as in sensor_msgs/Image. A channel count is NOT a
+// byte count: mono16 is one channel but two bytes, and yuv422_yuy2 is two bytes
+// with no whole number of channels. Unknown encodings fall through to 3, which is
+// a guess — prefer the row stride, which is exact for every format.
 inline size_t channels_for(const std::string &encoding) {
-  if (encoding == "mono8" || encoding == "mono16") return 1;
+  if (encoding == "mono8") return 1;
+  if (encoding == "mono16" || encoding == "yuv422" || encoding == "yuv422_yuy2" ||
+      encoding == "uyvy" || encoding == "yuyv") {
+    return 2;
+  }
   if (encoding == "rgba8" || encoding == "bgra8") return 4;
   return 3;
 }
 
-// Size of one frame. Call this rather than spelling out height * width * 3 at a
-// call site — that is the sort of thing that silently rots when a mono or RGBA
-// producer shows up.
+// Size of one frame from the row stride. `step` is bytes per row INCLUDING any
+// padding, so this is exact for every encoding and needs no per-format table.
+inline size_t frame_bytes_from_step(uint32_t height, uint32_t step) {
+  return static_cast<size_t>(height) * static_cast<size_t>(step);
+}
+
+// Same, for a producer with no step to hand. Guesses bytes-per-pixel from the
+// encoding, so it is wrong for any format channels_for does not know and for any
+// buffer whose rows are padded. Prefer frame_bytes_from_step.
 inline size_t frame_bytes(uint32_t height, uint32_t width, const std::string &encoding) {
   return static_cast<size_t>(height) * static_cast<size_t>(width) * channels_for(encoding);
 }
@@ -414,10 +426,15 @@ class ImageReader {
   // Same, taking the geometry off an announcement. Templated rather than typed
   // on shm_ros::msg::ShmImage so this header stays free of the generated message
   // — and so any message carrying the same fields works.
+  //
+  // Sizes from msg.step, which covers padded rows and every encoding. Note that
+  // the returned buffer has `step` bytes per row, NOT width*channels: wrap it as
+  // cv::Mat(height, width, type, ptr, msg.step) or the rows shear.
   template <typename MessageT>
   const uint8_t *frame_from(const MessageT &msg) {
-    return frame(msg.block_id, frame_bytes(msg.height, msg.width, msg.encoding),
-                 msg.segment);
+    const size_t bytes = msg.step > 0 ? frame_bytes_from_step(msg.height, msg.step)
+                                      : frame_bytes(msg.height, msg.width, msg.encoding);
+    return frame(msg.block_id, bytes, msg.segment);
   }
 
   const SegmentReader &segment_reader() const { return reader_; }

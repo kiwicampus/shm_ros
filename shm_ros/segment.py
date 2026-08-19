@@ -47,23 +47,27 @@ def segment_path(topic: str) -> str:
 
 
 def channels_for(encoding: str) -> int:
-    """Bytes per pixel for an encoding, as in ``sensor_msgs/Image``.
+    """BYTES per pixel for an encoding, as in ``sensor_msgs/Image``.
 
-    Unknown encodings are treated as 3: rgb8 is what every producer here writes.
+    A channel count is NOT a byte count: mono16 is one channel but two bytes, and
+    yuv422_yuy2 is two bytes with no whole number of channels. Unknown encodings
+    fall through to 3, which is a guess -- prefer the row stride, exact for every
+    format.
     """
-    if encoding in ("mono8", "mono16"):
+    if encoding == "mono8":
         return 1
+    if encoding in ("mono16", "yuv422", "yuv422_yuy2", "uyvy", "yuyv"):
+        return 2
     if encoding in ("rgba8", "bgra8"):
         return 4
     return 3
 
 
 def frame_bytes(height: int, width: int, encoding: str) -> int:
-    """Size of one frame.
+    """Size of one frame, guessed from the encoding.
 
-    Call this rather than spelling out ``height * width * 3`` at a call site --
-    that is the sort of thing that silently rots when a mono or RGBA producer
-    shows up.
+    Fallback only: wrong for any format :func:`channels_for` does not know and for
+    any buffer whose rows are padded. Prefer ``height * step``.
     """
     return height * width * channels_for(encoding)
 
@@ -217,11 +221,18 @@ class SegmentReader:
         return BUFFER_BASE + block_id * self._stride
 
     def frame(
-        self, block_id: int, height: int, width: int, channels: int = 3
+        self,
+        block_id: int,
+        height: int,
+        width: int,
+        channels: int = 3,
+        step: int = 0,
     ) -> Optional[np.ndarray]:
         """Read-only view of the frame in ``block_id``, or None.
 
-        Aliases the mapping: consume it before the writer laps the ring.
+        ``step`` is bytes per row INCLUDING padding; 0 means rows are packed.
+        Aliases the mapping when unpacked: consume it before the writer laps the
+        ring. A padded frame is copied, since the slice is not contiguous.
         """
         if self._view is None:
             self.last_error = "segment not mapped"
@@ -230,12 +241,23 @@ class SegmentReader:
             self.last_error = f"bad geometry {width}x{height}x{channels}"
             return None
 
+        row_bytes = width * channels
+        stride = step if step > 0 else row_bytes
+        if stride < row_bytes:
+            # The producer's rows are shorter than width*channels, so `channels`
+            # is wrong for this encoding. Fail loudly rather than read garbage.
+            self.last_error = (
+                f"step {stride} < {width}x{channels}={row_bytes} bytes per row; "
+                "the encoding's bytes-per-pixel is not what channels_for returned"
+            )
+            return None
+
         offset = self.block_offset(block_id)
         if offset < 0:
             self.last_error = f"block {block_id} outside the ring of {self._block_num}"
             return None
 
-        size = height * width * channels
+        size = stride * height
         if offset + size > self._length:
             self.last_error = (
                 f"block {block_id} needs {size} bytes at {offset}, "
@@ -243,9 +265,15 @@ class SegmentReader:
             )
             return None
 
-        return np.frombuffer(
-            self._view[offset : offset + size], dtype=np.uint8
-        ).reshape(height, width, channels)
+        flat = np.frombuffer(self._view[offset : offset + size], dtype=np.uint8)
+        if stride == row_bytes:
+            return flat.reshape(height, width, channels)
+        # Padded rows: reshape by the REAL stride and slice off the padding. A
+        # padded buffer reshaped straight to (h, w, c) does not fail — every row
+        # after the first starts late and the picture shears, silently.
+        return flat.reshape(height, stride)[:, :row_bytes].reshape(
+            height, width, channels
+        )
 
     def close(self) -> None:
         """Unmap and close. Idempotent, and safe with views outstanding."""
@@ -458,8 +486,12 @@ class ImageReader:
         width: int,
         channels: int = 3,
         segment: str = "",
+        step: int = 0,
     ) -> Optional[np.ndarray]:
-        """Read-only view of the announced block, or None with ``last_error`` set."""
+        """Read-only view of the announced block, or None with ``last_error`` set.
+
+        ``step`` is bytes per row including padding; 0 means packed rows.
+        """
         wanted = segment or self._topic
         if wanted != self._current:
             self._reader.close()
@@ -470,7 +502,7 @@ class ImageReader:
             self.last_error = self._reader.last_error
             return None
 
-        view = self._reader.frame(block_id, height, width, channels)
+        view = self._reader.frame(block_id, height, width, channels, step)
         if view is None:
             self.last_error = self._reader.last_error
             return None
@@ -479,7 +511,11 @@ class ImageReader:
         return view
 
     def frame_from(self, msg: object) -> Optional[np.ndarray]:
-        """Same, reading the fields off a ShmImage (or any message shaped like one)."""
+        """Same, reading the fields off a ShmImage (or any message shaped like one).
+
+        Passes ``msg.step`` through, so padded rows are sliced rather than
+        silently sheared.
+        """
         encoding = getattr(msg, "encoding", "") or "rgb8"
         return self.frame(
             msg.block_id,
@@ -487,6 +523,7 @@ class ImageReader:
             msg.width,
             channels_for(encoding),
             getattr(msg, "segment", "") or "",
+            int(getattr(msg, "step", 0) or 0),
         )
 
     def close(self) -> None:

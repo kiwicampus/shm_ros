@@ -135,12 +135,13 @@ def test_writer_geometry_matches_the_table(ceiling, block_num):
 class _Announcement:
     """The fields ImageReader.frame_from reads off a ShmImage."""
 
-    def __init__(self, block_id, height, width, encoding="rgb8", segment=""):
+    def __init__(self, block_id, height, width, encoding="rgb8", segment="", step=0):
         self.block_id = block_id
         self.height = height
         self.width = width
         self.encoding = encoding
         self.segment = segment
+        self.step = step
 
 
 def test_image_reader_round_trip(writer):
@@ -187,4 +188,77 @@ def test_image_reader_honours_the_announced_segment(writer):
         is not None
     )
     assert reader.segment == segment_name(TOPIC)
+    reader.close()
+
+
+# =============================================================================
+# Row padding and byte-per-pixel widths
+# =============================================================================
+
+
+def test_padded_rows_are_sliced_not_sheared(writer):
+    """Regression: step > width*channels must not skew the image.
+
+    A padded buffer reshaped straight to (h, w, c) does not fail — every row
+    after the first starts a few bytes late and the picture shears diagonally,
+    silently. V4L2 buffers pad rows to alignment routinely.
+    """
+    height, width, channels = 32, 50, 3
+    row_bytes = width * channels  # 150
+    step = 160  # padded to a 16-byte boundary
+    assert step > row_bytes
+
+    rows = [
+        np.concatenate(
+            [
+                np.full(row_bytes, r, dtype=np.uint8),  # payload: row index
+                np.full(step - row_bytes, 0xEE, dtype=np.uint8),  # padding marker
+            ]
+        )
+        for r in range(height)
+    ]
+    padded = np.concatenate(rows)
+    assert padded.nbytes == height * step
+
+    assert writer.open(padded.nbytes)
+    block_id = writer.write(padded.tobytes())
+
+    reader = SegmentReader(TOPIC)
+    assert reader.open(), reader.last_error
+    got = reader.frame(block_id, height, width, channels, step=step)
+    assert got is not None, reader.last_error
+    assert got.shape == (height, width, channels)
+    # Every row must be its own index, and no padding byte may appear.
+    for r in range(height):
+        assert (got[r] == r).all(), f"row {r} sheared"
+    assert not (got == 0xEE).any(), "padding leaked into the image"
+    reader.close()
+
+
+def test_step_shorter_than_row_fails_loudly(writer):
+    """A step below width*channels means the channel guess is wrong — error, not garbage."""
+    assert writer.open(4096)
+    reader = SegmentReader(TOPIC)
+    assert reader.open(), reader.last_error
+    assert reader.frame(0, 10, 10, 3, step=20) is None
+    assert "bytes per row" in reader.last_error
+    reader.close()
+
+
+def test_image_reader_handles_two_bytes_per_pixel(writer):
+    """yuv422_yuy2 is 2 bytes/px; the old table called every unknown encoding 3."""
+    from shm_ros.segment import ImageReader, channels_for
+
+    assert channels_for("yuv422_yuy2") == 2
+    height, width = 48, 64
+    frame = np.random.randint(0, 256, (height, width, 2), dtype=np.uint8)
+    assert writer.open(frame.nbytes)
+    block_id = writer.write(frame.tobytes())
+
+    reader = ImageReader(TOPIC)
+    msg = _Announcement(block_id, height, width, encoding="yuv422_yuy2")
+    msg.step = width * 2
+    got = reader.frame_from(msg)
+    assert got is not None, reader.last_error
+    assert np.array_equal(got, frame)
     reader.close()
