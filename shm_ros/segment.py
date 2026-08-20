@@ -56,9 +56,9 @@ def channels_for(encoding: str) -> int:
     """
     if encoding == "mono8":
         return 1
-    if encoding in ("mono16", "yuv422", "yuv422_yuy2", "uyvy", "yuyv"):
+    if encoding in ("mono16", "yuv422", "yuv422_yuy2", "uyvy", "yuyv", "16UC1"):
         return 2
-    if encoding in ("rgba8", "bgra8"):
+    if encoding in ("rgba8", "bgra8", "32FC1"):
         return 4
     return 3
 

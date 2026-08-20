@@ -113,6 +113,19 @@ constants, which is a drift hazard. `test/test_layout_parity.py` parses the
 header and asserts the two agree, so a change to one that misses the other fails
 the build.
 
+## Dev tools
+
+Two scripts, installed as `ros2 run shm_ros <name>`:
+
+- `image_to_shm_bridge.py <image_topic> [more_topics...]` — subscribes to a
+  plain `sensor_msgs/Image` topic and republishes it into a shm_ros segment.
+  Lets a recorded rosbag (or any Image-only source) feed a `use_shm=true`
+  consumer without its own shm producer: `ros2 bag play <bag>` on one side,
+  this bridge on the other, pointed at the same topic names.
+- `shm_ros_viewer.py [topic]` — live `cv2.imshow` viewer for a shm_ros stream
+  (default topic `/video_mapping/webcamtest/image_raw`). Handles rgb8/bgr8/
+  mono8/16UC1/32FC1, with a JET colormap for depth.
+
 ## ROS 1
 
 `shm_ros` also builds under catkin, message only, so a Noetic node can publish

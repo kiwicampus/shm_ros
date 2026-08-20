@@ -23,3 +23,10 @@ uint32 step                 # bytes per row, padding included
 uint64 block_id             # index of the block holding this frame
 uint64 size                 # payload bytes written into that block
 uint64 seq                  # producer frame counter, for gap detection
+
+# Producer-side kill switch for the GPU path (Jetson unified memory via
+# cudaHostRegister -- see include/shm_ros/cuda_host_mapping.hpp). Not required
+# for the CUDA mechanics themselves: a consumer could call device_ptr() either
+# way. It lets an operator disable every consumer's GPU attempt from one
+# producer param, without touching consumer code.
+bool uses_gpu

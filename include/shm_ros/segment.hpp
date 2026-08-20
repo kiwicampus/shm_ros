@@ -44,6 +44,10 @@
 #include <cstring>
 #include <string>
 
+#ifdef SHM_ROS_HAS_CUDA
+#include "shm_ros/cuda_host_mapping.hpp"
+#endif
+
 namespace shm_ros {
 
 // STATE_SIZE(4096) + EXTRA_SIZE(4096) from astribot's ShmConf. BLOCK_SIZE is 0
@@ -87,10 +91,10 @@ inline std::string segment_path(const std::string &topic) {
 inline size_t channels_for(const std::string &encoding) {
   if (encoding == "mono8") return 1;
   if (encoding == "mono16" || encoding == "yuv422" || encoding == "yuv422_yuy2" ||
-      encoding == "uyvy" || encoding == "yuyv") {
+      encoding == "uyvy" || encoding == "yuyv" || encoding == "16UC1") {
     return 2;
   }
-  if (encoding == "rgba8" || encoding == "bgra8") return 4;
+  if (encoding == "rgba8" || encoding == "bgra8" || encoding == "32FC1") return 4;
   return 3;
 }
 
@@ -200,6 +204,41 @@ class SegmentReader {
     return static_cast<const uint8_t *>(map_) + offset;
   }
 
+#ifdef SHM_ROS_HAS_CUDA
+  // Same as frame(), but returns a GPU-addressable pointer (Jetson unified
+  // memory via cudaHostRegister) instead of a host pointer for the caller to
+  // copy. Lazily opens a SEPARATE read-write mapping of the segment and
+  // registers THAT with CUDA, on first use -- confirmed on real hardware
+  // that cudaHostRegister(..., cudaHostRegisterMapped) rejects a read-only
+  // region outright ("invalid argument"), and map_ is deliberately read-only
+  // (a reader must never be able to write into someone else's segment nor
+  // this class needs to write through the CUDA mapping either; it exists
+  // only so the registration call succeeds).
+  //
+  // close() tears this down too, so a producer restart/resize (which forces
+  // a close()+reopen of map_) also forces a fresh CUDA mapping here -- never
+  // a stale registration pointing at a dead segment.
+  void *device_ptr(uint64_t block_id, size_t frame_bytes) {
+    if (map_ == nullptr || frame_bytes == 0 || block_id >= block_num_) return nullptr;
+    const size_t offset = kBufferBase + static_cast<size_t>(block_id) * stride_;
+    if (offset + frame_bytes > len_) return nullptr;
+
+    if (cuda_map_ == nullptr) {
+      const int fd = ::open(segment_path(topic_).c_str(), O_RDWR);
+      if (fd < 0) return nullptr;
+      void *map = mmap(nullptr, len_, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      if (map == MAP_FAILED) {
+        ::close(fd);
+        return nullptr;
+      }
+      cuda_fd_ = fd;
+      cuda_map_ = map;
+      cuda_mapping_.map(cuda_map_, len_);
+    }
+    return static_cast<uint8_t *>(cuda_mapping_.device_ptr(offset));
+  }
+#endif
+
   void close() {
     if (map_ != nullptr) {
       munmap(map_, len_);
@@ -209,6 +248,17 @@ class SegmentReader {
       ::close(fd_);
       fd_ = -1;
     }
+#ifdef SHM_ROS_HAS_CUDA
+    cuda_mapping_.unmap();
+    if (cuda_map_ != nullptr) {
+      munmap(cuda_map_, len_);
+      cuda_map_ = nullptr;
+    }
+    if (cuda_fd_ >= 0) {
+      ::close(cuda_fd_);
+      cuda_fd_ = -1;
+    }
+#endif
     len_ = 0;
     stride_ = 0;
     block_num_ = 0;
@@ -251,6 +301,11 @@ class SegmentReader {
   ino_t ino_ = 0;
   std::string topic_;
   mutable std::string last_error_;
+#ifdef SHM_ROS_HAS_CUDA
+  CudaHostMapping cuda_mapping_;
+  int cuda_fd_ = -1;
+  void *cuda_map_ = nullptr;
+#endif
 };
 
 // ============================================================================
@@ -436,6 +491,39 @@ class ImageReader {
                                       : frame_bytes(msg.height, msg.width, msg.encoding);
     return frame(msg.block_id, bytes, msg.segment);
   }
+
+#ifdef SHM_ROS_HAS_CUDA
+  // Same as frame()/frame_from(), but returns a GPU-addressable pointer
+  // (Jetson unified memory) instead of a host pointer to copy. See
+  // shm_ros::CudaHostMapping.
+  void *device_ptr(uint64_t block_id, size_t frame_bytes,
+                    const std::string &segment = std::string()) {
+    const std::string &wanted = segment.empty() ? topic_ : segment;
+    if (wanted != current_) {
+      reader_.close();
+      current_ = wanted;
+    }
+    if (!reader_.open(current_)) {
+      last_error_ = reader_.last_error();
+      return nullptr;
+    }
+    void *ptr = reader_.device_ptr(block_id, frame_bytes);
+    if (ptr == nullptr) {
+      last_error_ = "block " + std::to_string(block_id) + " unreadable in a ring of " +
+                    std::to_string(reader_.block_num());
+      return nullptr;
+    }
+    last_error_.clear();
+    return ptr;
+  }
+
+  template <typename MessageT>
+  void *device_ptr_from(const MessageT &msg) {
+    const size_t bytes = msg.step > 0 ? frame_bytes_from_step(msg.height, msg.step)
+                                      : frame_bytes(msg.height, msg.width, msg.encoding);
+    return device_ptr(msg.block_id, bytes, msg.segment);
+  }
+#endif
 
   const SegmentReader &segment_reader() const { return reader_; }
   const std::string &segment() const { return current_; }

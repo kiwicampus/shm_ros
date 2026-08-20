@@ -32,9 +32,15 @@ class ImagePublisher {
  public:
   // `node` may be an rclcpp::Node or a LifecycleNode. The segment is named after
   // the RESOLVED topic, so it matches what any consumer derives from it.
+  //
+  // `uses_gpu` is announced on every frame as a producer-side kill switch: it
+  // is not required for the CUDA mechanics (a consumer could call
+  // device_ptr() either way), but flipping one param here disables every
+  // consumer's GPU attempt at once, without touching consumer code.
   template <typename NodeT>
-  ImagePublisher(NodeT &node, const std::string &topic, const rclcpp::QoS &qos)
-      : logger_(node.get_logger()) {
+  ImagePublisher(NodeT &node, const std::string &topic, const rclcpp::QoS &qos,
+                 bool uses_gpu = false)
+      : logger_(node.get_logger()), uses_gpu_(uses_gpu) {
     publisher_ = node.template create_publisher<msg::ShmImage>(topic, qos);
     topic_name_ = publisher_->get_topic_name();
     segment_name_ = shm_ros::segment_name(topic_name_);
@@ -74,6 +80,7 @@ class ImagePublisher {
     announcement.block_id = static_cast<uint64_t>(block_id);
     announcement.size = size;
     announcement.seq = seq_++;
+    announcement.uses_gpu = uses_gpu_;
     publisher_->publish(announcement);
     return true;
   }
@@ -95,6 +102,7 @@ class ImagePublisher {
   std::string segment_name_;
   std::string last_error_;
   uint64_t seq_ = 0;
+  bool uses_gpu_ = false;
 };
 
 }  // namespace shm_ros

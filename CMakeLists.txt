@@ -29,6 +29,18 @@ if(ament_cmake_FOUND)  # ROS2
     $<INSTALL_INTERFACE:include>)
   target_compile_features(${PROJECT_NAME}_core INTERFACE cxx_std_17)
 
+  # Jetson unified-memory GPU path (SegmentReader::device_ptr /
+  # ImageReader::device_ptr): only compiled in if a CUDA toolkit is available,
+  # so packages that don't care about GPU frames never need CUDA to build
+  # shm_ros at all.
+  find_package(CUDAToolkit QUIET)
+  if(CUDAToolkit_FOUND)
+    target_link_libraries(${PROJECT_NAME}_core INTERFACE CUDA::cudart)
+    target_compile_definitions(${PROJECT_NAME}_core INTERFACE SHM_ROS_HAS_CUDA)
+  else()
+    message(WARNING "${PROJECT_NAME}: CUDA toolkit not found -- building without GPU (device_ptr) support")
+  endif()
+
   install(DIRECTORY include/ DESTINATION include)
   install(TARGETS ${PROJECT_NAME}_core EXPORT export_${PROJECT_NAME})
 
@@ -43,6 +55,13 @@ if(ament_cmake_FOUND)  # ROS2
   # package pair, since the name does not end in _msgs.
   install(FILES mapping_rules.yaml DESTINATION share/${PROJECT_NAME})
 
+  # Dev tools: a rosbag/plain-Image bridge and a live GUI viewer, runnable as
+  # `ros2 run shm_ros <script>.py`. Not part of the library API.
+  install(PROGRAMS
+    scripts/image_to_shm_bridge.py
+    scripts/shm_ros_viewer.py
+    DESTINATION lib/${PROJECT_NAME})
+
   if(BUILD_TESTING)
     find_package(ament_cmake_pytest REQUIRED)
     ament_add_pytest_test(test_layout_parity test/test_layout_parity.py)
@@ -52,6 +71,12 @@ if(ament_cmake_FOUND)  # ROS2
   ament_export_include_directories(include)
   ament_export_targets(export_${PROJECT_NAME})
   ament_export_dependencies(rosidl_default_runtime std_msgs)
+  if(CUDAToolkit_FOUND)
+    # So consumers' generated Config.cmake also calls find_package(CUDAToolkit)
+    # -- otherwise CUDA::cudart (in our exported link interface) resolves to a
+    # missing target in their scope, even though we already linked it here.
+    ament_export_dependencies(CUDAToolkit)
+  endif()
   ament_package()
 
 elseif(catkin_FOUND)  # ROS1
