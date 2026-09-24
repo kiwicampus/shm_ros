@@ -9,11 +9,149 @@ producers, bridges and consumers.
 """
 
 # =============================================================================
+import ctypes
+import ctypes.util
 import mmap
 import os
 from typing import Optional, Tuple
 
 import numpy as np
+
+# =============================================================================
+
+#: cudaHostRegisterMapped, from cuda_runtime_api.h -- requests a device pointer
+#: for the registered range (cudaHostGetDevicePointer only resolves ranges
+#: registered with this flag).
+_CUDA_HOST_REGISTER_MAPPED = 0x02
+_CUDA_MEMCPY_DEVICE_TO_HOST = 2
+_CUDA_MEMCPY_DEVICE_TO_DEVICE = 3
+
+_cudart: Optional[ctypes.CDLL] = None
+_cudart_load_failed = False
+
+
+def _load_cudart() -> Optional[ctypes.CDLL]:
+    """The CUDA runtime, loaded once. None (cached) if it is not installed.
+
+    ctypes rather than a Python CUDA package (cupy/pycuda/torch) on purpose:
+    every shm_ros consumer would otherwise need one of those importable just to
+    import ``segment``, even the ones that never touch a GPU frame.
+    """
+    global _cudart, _cudart_load_failed
+    if _cudart is not None or _cudart_load_failed:
+        return _cudart
+    name = ctypes.util.find_library("cudart") or "libcudart.so"
+    try:
+        _cudart = ctypes.CDLL(name)
+    except OSError:
+        _cudart_load_failed = True
+        return None
+    return _cudart
+
+
+class CudaHostMapping:
+    """ctypes port of ``shm_ros/cuda_host_mapping.hpp``.
+
+    Registers an already-mapped host range with CUDA and hands back the
+    device-visible pointer for it (Jetson unified memory, or zero-copy over
+    PCIe on a discrete GPU). A no-op producing an unmapped instance when CUDA
+    is not installed -- callers check :meth:`is_mapped`.
+    """
+
+    def __init__(self) -> None:
+        self._host_ptr: Optional[ctypes.c_void_p] = None
+        self._device_ptr = 0
+
+    def map(self, address: int, length: int) -> bool:
+        """Register ``length`` bytes at ``address``. Idempotent once mapped."""
+        if self.is_mapped():
+            return True
+        cudart = _load_cudart()
+        if cudart is None:
+            return False
+
+        host_ptr = ctypes.c_void_p(address)
+        rc = cudart.cudaHostRegister(
+            host_ptr, ctypes.c_size_t(length), ctypes.c_uint(_CUDA_HOST_REGISTER_MAPPED)
+        )
+        if rc != 0:
+            return False
+
+        device_ptr = ctypes.c_void_p()
+        rc = cudart.cudaHostGetDevicePointer(
+            ctypes.byref(device_ptr), host_ptr, ctypes.c_uint(0)
+        )
+        if rc != 0:
+            cudart.cudaHostUnregister(host_ptr)
+            return False
+
+        self._host_ptr = host_ptr
+        self._device_ptr = device_ptr.value or 0
+        return True
+
+    def is_mapped(self) -> bool:
+        """Whether :meth:`map` has succeeded and not since been undone."""
+        return self._host_ptr is not None
+
+    def device_ptr(self, offset: int = 0) -> int:
+        """Device-visible address of ``offset`` bytes into the mapping, or 0."""
+        return self._device_ptr + offset if self.is_mapped() else 0
+
+    def unmap(self) -> None:
+        """Undo the registration. Safe to call when never mapped."""
+        if self._host_ptr is not None:
+            cudart = _load_cudart()
+            if cudart is not None:
+                cudart.cudaHostUnregister(self._host_ptr)
+            self._host_ptr = None
+        self._device_ptr = 0
+
+
+def cuda_memcpy_device_to_host(device_ptr: int, nbytes: int) -> bytes:
+    """``nbytes`` read from ``device_ptr`` through the CUDA runtime.
+
+    Round-trips through the GPU exactly as a real kernel consumer would: this
+    is what proves ``device_ptr`` is a working, GPU-addressable pointer rather
+    than an opaque integer nothing ever dereferenced.
+    """
+    cudart = _load_cudart()
+    if cudart is None:
+        raise RuntimeError("CUDA runtime not available")
+    buf = ctypes.create_string_buffer(nbytes)
+    rc = cudart.cudaMemcpy(
+        buf,
+        ctypes.c_void_p(device_ptr),
+        ctypes.c_size_t(nbytes),
+        ctypes.c_int(_CUDA_MEMCPY_DEVICE_TO_HOST),
+    )
+    if rc != 0:
+        raise RuntimeError(f"cudaMemcpy(D2H) failed: rc={rc}")
+    return buf.raw
+
+
+def cuda_memcpy_device_to_device(
+    dst_device_ptr: int, src_device_ptr: int, nbytes: int
+) -> None:
+    """Copy ``nbytes`` device-to-device, entirely on the GPU -- no host involved.
+
+    For a consumer that wants the frame to actually LIVE on the GPU (a torch/
+    cupy CUDA tensor it will run a model on) rather than one that just wants
+    the bytes: point ``dst_device_ptr`` at memory a GPU framework already
+    allocated (e.g. a ``torch.empty(..., device="cuda").data_ptr()``) and the
+    shm segment's pixels land there without ever touching this process's RAM.
+    """
+    cudart = _load_cudart()
+    if cudart is None:
+        raise RuntimeError("CUDA runtime not available")
+    rc = cudart.cudaMemcpy(
+        ctypes.c_void_p(dst_device_ptr),
+        ctypes.c_void_p(src_device_ptr),
+        ctypes.c_size_t(nbytes),
+        ctypes.c_int(_CUDA_MEMCPY_DEVICE_TO_DEVICE),
+    )
+    if rc != 0:
+        raise RuntimeError(f"cudaMemcpy(D2D) failed: rc={rc}")
+
 
 # =============================================================================
 
@@ -110,6 +248,9 @@ class SegmentReader:
         self._block_num = 0
         self._device = -1
         self._inode = -1
+        self._cuda_file: Optional[int] = None
+        self._cuda_map: Optional[mmap.mmap] = None
+        self._cuda_mapping: Optional[CudaHostMapping] = None
         self.last_error = ""
 
     @property
@@ -275,8 +416,91 @@ class SegmentReader:
             height, width, channels
         )
 
+    def device_ptr(self, block_id: int, frame_bytes: int) -> int:
+        """Same as :meth:`frame`, but a GPU-addressable pointer instead of a
+        host view for the caller to copy.
+
+        Lazily opens a SEPARATE read-write mapping of the segment and
+        registers THAT with CUDA, on first use: ``cudaHostRegister(...,
+        cudaHostRegisterMapped)`` rejects a read-only region outright
+        ("invalid argument", confirmed on real hardware), and the normal
+        ``map_`` stays read-only on purpose -- a reader must never be able to
+        write into someone else's segment, and nothing here needs to write
+        through the CUDA mapping either; it exists only so the registration
+        call succeeds.
+
+        Returns 0 (not an exception) when CUDA is unavailable, the segment
+        isn't mapped, or the geometry is out of range -- callers fall back to
+        :meth:`frame`, they don't need to special-case a missing GPU.
+        """
+        if (
+            self._map is None
+            or frame_bytes <= 0
+            or block_id < 0
+            or block_id >= self._block_num
+        ):
+            return 0
+        offset = BUFFER_BASE + block_id * self._stride
+        if offset + frame_bytes > self._length:
+            self.last_error = (
+                f"block {block_id} needs {frame_bytes} bytes at {offset}, "
+                f"segment is {self._length}"
+            )
+            return 0
+
+        if self._cuda_map is None:
+            try:
+                descriptor = os.open(self._path, os.O_RDWR)
+            except OSError as exc:
+                self.last_error = f"cannot open {self._path} for CUDA mapping: {exc}"
+                return 0
+            try:
+                mapping = mmap.mmap(
+                    descriptor,
+                    self._length,
+                    mmap.MAP_SHARED,
+                    mmap.PROT_READ | mmap.PROT_WRITE,
+                )
+            except (OSError, ValueError) as exc:
+                os.close(descriptor)
+                self.last_error = f"cannot mmap {self._path} read-write: {exc}"
+                return 0
+
+            buf = (ctypes.c_char * self._length).from_buffer(mapping)
+            address = ctypes.addressof(buf)
+            cuda_mapping = CudaHostMapping()
+            if not cuda_mapping.map(address, self._length):
+                mapping.close()
+                os.close(descriptor)
+                self.last_error = (
+                    "cudaHostRegister failed (no CUDA device? see nvidia-smi)"
+                )
+                return 0
+
+            self._cuda_file = descriptor
+            self._cuda_map = mapping
+            self._cuda_mapping = cuda_mapping
+
+        assert self._cuda_mapping is not None
+        return self._cuda_mapping.device_ptr(offset)
+
     def close(self) -> None:
         """Unmap and close. Idempotent, and safe with views outstanding."""
+        if self._cuda_mapping is not None:
+            self._cuda_mapping.unmap()
+            self._cuda_mapping = None
+        if self._cuda_map is not None:
+            try:
+                self._cuda_map.close()
+            except BufferError:
+                pass
+            self._cuda_map = None
+        if self._cuda_file is not None:
+            try:
+                os.close(self._cuda_file)
+            except OSError:
+                pass
+            self._cuda_file = None
         if self._view is not None:
             try:
                 self._view.release()
@@ -524,6 +748,72 @@ class ImageReader:
             channels_for(encoding),
             getattr(msg, "segment", "") or "",
             int(getattr(msg, "step", 0) or 0),
+        )
+
+    def device_ptr_from(self, msg: object) -> int:
+        """GPU-addressable pointer to the announced block, or 0.
+
+        0 means: fall back to :meth:`frame_from`. That covers every reason a
+        GPU read isn't available here -- CUDA not installed, the producer
+        never stamped ``uses_gpu``, the segment isn't mapped yet -- a caller
+        that only wants pixels doesn't need to tell those apart.
+        """
+        if not getattr(msg, "uses_gpu", False):
+            self.last_error = "producer did not stamp uses_gpu"
+            return 0
+
+        wanted = getattr(msg, "segment", "") or self._topic
+        if wanted != self._current:
+            self._reader.close()
+            self._reader = SegmentReader(wanted)
+            self._current = wanted
+        if not self._reader.open():
+            self.last_error = self._reader.last_error
+            return 0
+
+        encoding = getattr(msg, "encoding", "") or "rgb8"
+        step = int(getattr(msg, "step", 0) or 0)
+        bytes_needed = (
+            step * msg.height
+            if step > 0
+            else frame_bytes(msg.height, msg.width, encoding)
+        )
+        ptr = self._reader.device_ptr(msg.block_id, bytes_needed)
+        if not ptr:
+            self.last_error = self._reader.last_error or "no GPU device pointer"
+        return ptr
+
+    def gpu_frame_from(self, msg: object) -> Optional[np.ndarray]:
+        """Same picture as :meth:`frame_from`, but read through the GPU.
+
+        Resolves ``device_ptr_from`` and round-trips the bytes with a real
+        ``cudaMemcpy(D2H)`` -- the same mechanism a CUDA kernel would use to
+        consume the frame, not a stand-in for it. None (with ``last_error``
+        set) whenever the GPU path isn't available; callers fall back to
+        :meth:`frame_from`.
+        """
+        ptr = self.device_ptr_from(msg)
+        if not ptr:
+            return None
+
+        encoding = getattr(msg, "encoding", "") or "rgb8"
+        channels = channels_for(encoding)
+        row_bytes = msg.width * channels
+        step = int(getattr(msg, "step", 0) or 0)
+        stride = step if step > 0 else row_bytes
+        size = stride * msg.height
+
+        try:
+            raw = cuda_memcpy_device_to_host(ptr, size)
+        except RuntimeError as exc:
+            self.last_error = str(exc)
+            return None
+
+        flat = np.frombuffer(raw, dtype=np.uint8)
+        if stride == row_bytes:
+            return flat.reshape(msg.height, msg.width, channels)
+        return flat.reshape(msg.height, stride)[:, :row_bytes].reshape(
+            msg.height, msg.width, channels
         )
 
     def close(self) -> None:
