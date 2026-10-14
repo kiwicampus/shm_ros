@@ -25,6 +25,10 @@ BUFFER_BASE = 4096 + 4096
 #: Written once at creation, so a plain read is enough.
 CEILING_OFFSET = 0x18
 
+#: ShmConf's State seq: uint32 count of blocks the writer has STARTED, bumped
+#: before a block is filled so a lock-free reader can tell it was lapped.
+SEQ_OFFSET = 0x0C
+
 #: ShmConf's MESSAGE_SIZE_* / BLOCK_NUM_* ladder, ascending.
 BUCKETS: Tuple[Tuple[int, int], ...] = (
     (16 << 10, 512),
@@ -407,6 +411,12 @@ class SegmentWriter:
             return -1
         block_id = self._seq % self._block_num
         self._seq += 1
+        # shortcut: no memory fence from Python, so a weakly ordered CPU (ARM) may
+        # show the pixels before this counter; fine while readers finish well
+        # inside one ring lap, move the write to C if a reader ever runs that late.
+        self._map[SEQ_OFFSET : SEQ_OFFSET + 4] = (self._seq & 0xFFFFFFFF).to_bytes(
+            4, "little"
+        )
         offset = BUFFER_BASE + block_id * self._stride
         self._map[offset : offset + len(data)] = data
         return block_id

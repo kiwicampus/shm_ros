@@ -12,7 +12,13 @@ parses the constants straight out of segment.hpp and compares.
 import re
 from pathlib import Path
 
-from shm_ros.segment import BUCKETS, BUFFER_BASE, CEILING_OFFSET, channels_for
+from shm_ros.segment import (
+    BUCKETS,
+    BUFFER_BASE,
+    CEILING_OFFSET,
+    SEQ_OFFSET,
+    channels_for,
+)
 
 # =============================================================================
 
@@ -45,6 +51,12 @@ def test_ceiling_offset_matches():
     match = re.search(r"kCeilingOffset\s*=\s*(0x[0-9a-fA-F]+)\s*;", _header())
     assert match, "kCeilingOffset not found in the header"
     assert int(match.group(1), 16) == CEILING_OFFSET
+
+
+def test_seq_offset_matches():
+    match = re.search(r"kSeqOffset\s*=\s*(0x[0-9a-fA-F]+)\s*;", _header())
+    assert match, "kSeqOffset not found in the header"
+    assert int(match.group(1), 16) == SEQ_OFFSET
 
 
 def test_bucket_ladder_matches_exactly():

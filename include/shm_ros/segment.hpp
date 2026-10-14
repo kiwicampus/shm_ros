@@ -55,6 +55,23 @@ inline constexpr size_t kBufferBase = 4096 + 4096;
 // (0x00 vptr, 0x08 need_remap, 0x0c seq, 0x14 reference_counts, 0x18 ceiling.)
 inline constexpr size_t kCeilingOffset = 0x18;
 
+// ShmConf's State seq: a uint32 count of blocks the writer has STARTED. CyberRT
+// bumps it before it fills a block, and so does SegmentWriter, so a reader that
+// loads it after a lock-free read knows whether the writer lapped that block.
+inline constexpr size_t kSeqOffset = 0x0c;
+
+// Whether the block holding announced frame `announced_seq` was rewritten, given
+// `writes_started` read AFTER the pixels. The block is safe while the writer has
+// not started frame announced_seq + block_num. Assumes the announcement seq counts
+// writes from 0 like the writer; when the two disagree (no counter in the segment,
+// or a producer reopened the segment) it cannot tell and says false.
+inline bool block_overwritten(uint32_t writes_started, uint64_t announced_seq, uint32_t block_num) {
+  if (writes_started == 0) return false;
+  const uint32_t ahead = writes_started - static_cast<uint32_t>(announced_seq);
+  if (ahead > 0x80000000u) return false;  // writer counter behind: out of step
+  return ahead > block_num;
+}
+
 // ShmConf's MESSAGE_SIZE_* / BLOCK_NUM_* ladder, ascending.
 struct Bucket {
   size_t ceiling;
@@ -189,6 +206,17 @@ class SegmentReader {
     if (fd_ < 0) return false;
     struct stat self {};
     return fstat(fd_, &self) != 0 || self.st_nlink == 0;
+  }
+
+  // The writer's count of started blocks (kSeqOffset), or 0 when unmapped or
+  // when the writer keeps no counter. Call it AFTER reading the pixels: the
+  // acquire fence keeps the pixel loads before this load (seqlock reader side).
+  uint32_t writes_started() const {
+    if (map_ == nullptr) return 0;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return __atomic_load_n(
+        reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(map_) + kSeqOffset),
+        __ATOMIC_RELAXED);
   }
 
   // Pointer to `frame_bytes` of pixels in `block_id`, or nullptr. The pointer
@@ -343,6 +371,11 @@ class SegmentWriter {
   int64_t write(const uint8_t *data, size_t size) {
     if (map_ == nullptr || data == nullptr || size == 0 || size > stride_) return -1;
     const uint32_t block_id = static_cast<uint32_t>(seq_++ % block_num_);
+    // Count the write as started BEFORE touching the block, as CyberRT does; the
+    // release fence keeps this store ahead of the pixel stores (seqlock writer side)
+    __atomic_store_n(reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(map_) + kSeqOffset),
+                     static_cast<uint32_t>(seq_), __ATOMIC_RELAXED);
+    std::atomic_thread_fence(std::memory_order_release);
     std::memcpy(static_cast<uint8_t *>(map_) + kBufferBase + block_id * stride_, data, size);
     std::atomic_thread_fence(std::memory_order_release);
     return static_cast<int64_t>(block_id);

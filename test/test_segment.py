@@ -11,6 +11,7 @@ from shm_ros.segment import (
     BUCKETS,
     BUFFER_BASE,
     CEILING_OFFSET,
+    SEQ_OFFSET,
     SegmentReader,
     SegmentWriter,
     bucket_for_frame,
@@ -75,6 +76,21 @@ def test_writer_announces_its_stride(writer):
         handle.seek(CEILING_OFFSET)
         announced = int.from_bytes(handle.read(8), "little")
     assert announced == writer.stride == (1 << 20)
+
+
+def test_writer_counts_started_blocks(writer):
+    """0x0c holds the writes started, so a lock-free reader can tell it was lapped."""
+    assert writer.open(1024)
+
+    def counter():
+        with open(writer.path, "rb") as handle:
+            handle.seek(SEQ_OFFSET)
+            return int.from_bytes(handle.read(4), "little")
+
+    assert counter() == 0
+    for _ in range(3):
+        writer.write(b"\x01" * 1024)
+    assert counter() == 3
 
 
 def test_reader_follows_the_announced_stride(writer):
