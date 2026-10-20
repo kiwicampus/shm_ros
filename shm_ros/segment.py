@@ -11,7 +11,7 @@ producers, bridges and consumers.
 # =============================================================================
 import mmap
 import os
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -539,3 +539,54 @@ class ImageReader:
     def close(self) -> None:
         """Unmap the segment."""
         self._reader.close()
+
+
+#: encoding -> (dtype, channels) for :class:`ImageDecoder`
+ENCODING_DTYPE = {
+    "rgb8": (np.uint8, 3),
+    "bgr8": (np.uint8, 3),
+    "mono8": (np.uint8, 1),
+    "16UC1": (np.uint16, 1),
+    "mono16": (np.uint16, 1),
+    "32FC1": (np.float32, 1),
+}
+
+
+class ImageDecoder:
+    """Typed COPIES of announced frames, one :class:`ImageReader` per segment.
+
+    Use this rather than :meth:`ImageReader.frame_from` when the frame outlives the
+    callback: the ring has no locking, and the producer overwrites a block once it
+    laps the ring, so a view would change under the caller.
+    """
+
+    def __init__(self) -> None:
+        self._readers: Dict[str, ImageReader] = {}
+
+    def decode(self, msg: object) -> np.ndarray:
+        """Return a copy of the frame announced by ``msg`` (a ShmImage or alike)."""
+        spec = ENCODING_DTYPE.get(msg.encoding)
+        if spec is None:
+            raise ValueError(f"Unsupported shm image encoding: {msg.encoding}")
+        dtype, channels = spec
+        row_bytes = msg.width * channels * np.dtype(dtype).itemsize
+        step = msg.step or row_bytes
+
+        reader = self._readers.get(msg.segment)
+        if reader is None:
+            reader = self._readers[msg.segment] = ImageReader(msg.segment)
+        # Read raw rows as bytes (1 byte per "pixel", `step` wide) so any dtype/padding works
+        raw = reader.frame(msg.block_id, msg.height, step, 1, msg.segment, step)
+        if raw is None:
+            raise RuntimeError(f"Cannot read shm frame: {reader.last_error}")
+
+        pixels = raw.reshape(msg.height, step)[:, :row_bytes].copy().view(dtype)
+        if channels == 1:
+            return pixels.reshape(msg.height, msg.width)
+        return pixels.reshape(msg.height, msg.width, channels)
+
+    def close(self) -> None:
+        """Unmap every segment."""
+        for reader in self._readers.values():
+            reader.close()
+        self._readers = {}
