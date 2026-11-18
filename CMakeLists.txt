@@ -16,6 +16,8 @@ if(ament_cmake_FOUND)  # ROS2
   find_package(ament_cmake_python REQUIRED)
   find_package(rosidl_default_generators REQUIRED)
   find_package(std_msgs REQUIRED)
+  find_package(rclcpp REQUIRED)
+  find_package(sensor_msgs REQUIRED)
 
   rosidl_generate_interfaces(${PROJECT_NAME}
     "msg/ShmImage.msg"
@@ -32,6 +34,21 @@ if(ament_cmake_FOUND)  # ROS2
   install(DIRECTORY include/ DESTINATION include)
   install(TARGETS ${PROJECT_NAME}_core EXPORT export_${PROJECT_NAME})
 
+  # shm_to_image: republishes ShmImage streams as sensor_msgs/Image for stock tools.
+  rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} rosidl_typesupport_cpp)
+  add_library(shm_to_image_lib src/shm_to_image.cpp)
+  target_include_directories(shm_to_image_lib PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+  target_link_libraries(shm_to_image_lib ${PROJECT_NAME}_core "${cpp_typesupport_target}")
+  ament_target_dependencies(shm_to_image_lib rclcpp sensor_msgs)
+  add_executable(shm_to_image src/shm_to_image_main.cpp)
+  target_link_libraries(shm_to_image shm_to_image_lib)
+  install(TARGETS shm_to_image_lib shm_to_image
+    ARCHIVE DESTINATION lib
+    LIBRARY DESTINATION lib
+    RUNTIME DESTINATION lib/${PROJECT_NAME})
+  install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
+
   # rosidl already generates a Python package named shm_ros (holding shm_ros.msg),
   # so ament_python_install_package would collide on the same target. Install our
   # module INTO that package instead: shm_ros.segment sits beside shm_ros.msg.
@@ -47,6 +64,9 @@ if(ament_cmake_FOUND)  # ROS2
     find_package(ament_cmake_pytest REQUIRED)
     ament_add_pytest_test(test_layout_parity test/test_layout_parity.py)
     ament_add_pytest_test(test_segment test/test_segment.py)
+    find_package(ament_cmake_gtest REQUIRED)
+    ament_add_gtest(test_shm_to_image test/test_shm_to_image.cpp)
+    target_link_libraries(test_shm_to_image shm_to_image_lib)
   endif()
 
   ament_export_include_directories(include)

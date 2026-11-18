@@ -22,9 +22,12 @@
   <exec_depend condition="$ROS_VERSION == 1">message_runtime</exec_depend>
 
   <depend>std_msgs</depend>
+  <depend condition="$ROS_VERSION == 2">rclcpp</depend>
+  <depend condition="$ROS_VERSION == 2">sensor_msgs</depend>
   <exec_depend condition="$ROS_VERSION == 2">python3-numpy</exec_depend>
 
   <test_depend condition="$ROS_VERSION == 2">ament_cmake_pytest</test_depend>
+  <test_depend condition="$ROS_VERSION == 2">ament_cmake_gtest</test_depend>
 
   <member_of_group condition="$ROS_VERSION == 2">rosidl_interface_packages</member_of_group>
 
