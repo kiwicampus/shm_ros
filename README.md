@@ -20,6 +20,7 @@ your own producers.
 | | plus `channels_for` / `frame_bytes`, so no caller spells out `h * w * 3` |
 | `include/shm_ros/segment.hpp` | also `ImageReader`: the consumer rules, ROS-free |
 | `shm_ros/segment.py` | the same three classes in pure Python |
+| `shm_to_image` | node that republishes ShmImage streams as `sensor_msgs/Image` |
 
 C++ is header-only, so there is nothing to link beyond `rclcpp` and this
 package's typesupport.
@@ -52,6 +53,27 @@ const uint8_t *pixels = reader.frame_from(*msg);   // geometry, channels, segmen
 `ImageReader` takes plain fields rather than a message, so it serves any
 announcement type — `shm_ros/ShmImage` from your producers, the vendor's own from
 theirs. It creates no subscription: QoS and wiring stay with the consumer.
+
+## Republishing as sensor_msgs/Image
+
+Stock tools (`ros2 bag record`, rviz) cannot read shared memory. `shm_to_image`
+copies each announced frame into a plain `sensor_msgs/Image`, one stream per entry
+in its yaml, and skips the copy while a stream's output has no subscriber.
+
+```yaml
+shm_to_image:
+  ros__parameters:
+    streams: [head_depth]
+    head_depth:
+      input_topic: /astribot_camera/head_rgbd/depth_image_fixed
+      output_topic: /astribot_camera/head_rgbd/depth/image_raw
+      frame_id: head_rgbd_depth   # optional, empty keeps the producer's
+      encoding: 16UC1             # optional, empty keeps the producer's
+```
+
+```bash
+ros2 launch shm_ros shm_to_image.launch.py params_file:=<yaml> streams:=head_depth
+```
 
 ## Two rules that fail silently if you break them
 
